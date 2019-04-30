@@ -88,12 +88,11 @@ data1 = df.loc[:, ['pm2.5', 'DEWP', 'TEMP', 'PRES', 'Iws', 'Is', 'Ir', 'cbwd_NE'
 data2 = df.values.copy()
 
 ##
-print(data1.shape)
 X = data1
 Y = df.loc[:,'pm2.5'].values.copy().reshape(df.shape[0],1)
 
 ## z-score transform x - not including those one-hot columns!
-for i in range(X.shape[1] - 4):
+for i in range(0,7):
     currentFeature = X[:, i].reshape(X.shape[0],1)
     X[:, i] = scalar.fit_transform(currentFeature).reshape(X.shape[0])
 
@@ -105,9 +104,9 @@ input_seq_len = 8
 output_seq_len = 1
 
 def generate_train_samples(x, y, batch_size=24, input_seq_len=input_seq_len,
-                           output_seq_len=output_seq_len):
+                           output_seq_len=output_seq_len,replace=False):
     total_start_points = len(x) - input_seq_len - output_seq_len
-    start_x_idx = np.random.choice(range(total_start_points), batch_size, replace=False)
+    start_x_idx = np.random.choice(range(total_start_points), batch_size, replace=replace)
 
     input_batch_idxs = [list(range(i, i + input_seq_len)) for i in start_x_idx]
     input_seq = np.take(x, input_batch_idxs, axis=0)
@@ -167,17 +166,18 @@ for train, test in kFolds.split(X):
 # LSTM
 learning_rate_lstm = np.power(10.0,-2.0)
 training_steps = 100
-display_step = 10
-num_input = X.shape[0]
+display_step = 100
+num_input = X.shape[1]
 timesteps = input_seq_len
-num_units = 100
+num_units = 30
 num_classes = 1
 num_layers = 2
 batch_size = 16
+_lambda = 0.003
 tf.reset_default_graph()
 
-X = tf.placeholder("float", [None, timesteps, X.shape[0]])
-Y = tf.placeholder("float", [None, timesteps, num_classes])
+x = tf.placeholder("float", [None, timesteps, X.shape[1]])
+y = tf.placeholder("float", [None, output_seq_len, num_classes])
 
 keep_prob = 0.5
 
@@ -192,32 +192,33 @@ initializer = tf.random_uniform_initializer(-1, 1)
 
 
 def RNN(x, weights, biases):
-    outputs = x
+    inp = tf.unstack(x ,timesteps,1)
     # track through the layers
     for layer in range(num_layers):
         with tf.variable_scope('encoder_{}'.format(layer), reuse=tf.AUTO_REUSE):
             # forward cells
-            cell_fw = tf.contrib.rnn.LSTMCell(num_units, initializer=initializer)
-            cell_fw = tf.contrib.rnn.DropoutWrapper(cell_fw, input_keep_prob=keep_prob)
-            # backward cells
-            cell_bw = tf.contrib.rnn.LSTMCell(num_units, initializer=initializer)
-            cell_bw = tf.contrib.rnn.DropoutWrapper(cell_bw, input_keep_prob=keep_prob)
+            lstm_layer = tf.contrib.rnn.LSTMCell(num_units,initializer=initializer)
+            outputs, _ = rnn.static_rnn(lstm_layer, inp, dtype="float32")
 
-            (output_fw, output_bw), last_state = tf.nn.bidirectional_dynamic_rnn(cell_fw, cell_bw, outputs,
-                                                                                 dtype=tf.float32)
-
-    rnn_outputs_fw = tf.reshape(output_fw, [-1, num_units])
-    rnn_outputs_bw = tf.reshape(output_bw, [-1, num_units])
-    out_fw = tf.matmul(rnn_outputs_fw, weights['out']) + biases['out']
-    out_bw = tf.matmul(rnn_outputs_bw, weights['out']) + biases['out']
-    return np.add(out_fw, out_bw)
+    #rnn_outputs_fw = tf.reshape(output_fw, [-1, num_units])
+    #rnn_outputs_bw = tf.reshape(output_bw, [-1, num_units])
+    output = tf.matmul(outputs[-1], weights['out']) + biases['out']
+    #out_bw = tf.matmul(rnn_outputs_bw, weights['out']) + biases['out']
+    return output
 
 
-logits = RNN(X, weights, biases)
+logits = RNN(x, weights, biases)
 
 prediction = tf.nn.sigmoid(logits)
 
-loss = tf.reduce_mean(tf.pow(prediction - Y, 2))
+# Training loss and optimizer
+
+loss = tf.reduce_mean(tf.pow(prediction - y, 2))
+
+# L2 regularization for weights and biasesreg_loss = 0
+regularizers = tf.nn.l2_loss(weights['out']) + tf.nn.l2_loss(biases['out'])
+
+loss = loss + _lambda * regularizers
 
 train_op = tf.train.AdamOptimizer(learning_rate_lstm).minimize(loss)
 # Add the ops to initialize variables.  These will include
@@ -248,12 +249,12 @@ for train, test in kFolds.split(X):
         print("Training losses: ")
         for i in range(training_steps):
             batch_input, batch_output = generate_train_samples(xTrain,yTrain,batch_size=batch_size)
-            _, loss_t = sess.run([train_op, loss], feed_dict={X: xTrain, Y: yTest})
+            _, loss_t = sess.run([train_op, loss], feed_dict={x: batch_input, y: batch_output})
             print(loss_t)
-
+        #init = tf.global_variables_initializer()
         test_x, test_y = generate_test_samples(xTest, yTest)
 
-        preds = sess.run(prediction, feed_dict={X: test_x, Y: test_y})
+        preds = sess.run(prediction, feed_dict={x: test_x, y: test_y})
 
         inv_test = scalar.inverse_transform(test_y.reshape(test_y.shape[0],1))
         inv_preds = scalar.inverse_transform(preds.reshape(preds.shape[0],1))
@@ -270,7 +271,7 @@ input_seq_len = input_seq_len
 # length of output signals
 output_seq_len = output_seq_len
 # size of LSTM Cell
-hidden_dim = 100
+hidden_dim = 30
 # num of input signals
 input_dim = X.shape[1]
 # num of output signals
@@ -518,6 +519,57 @@ for train, test in kFolds.split(X):
         inv_preds = scalar.inverse_transform(final_preds.reshape(final_preds.shape[0],1))
         print("Test rmse is: ", np.sqrt(np.mean((inv_preds - inv_test) ** 2)))
 ##
+from keras.models import Model, Sequential
+from keras.layers import Dense, Input, concatenate
+from keras.layers import LSTM
+from keras.layers.core import Reshape
 
 
+def lstm(xtrain, ytrain):
+    inputs = Input((timesteps, xtrain.shape[1]))
+
+    # ~inputs = Embedding(output_dim=xtrain.shape[0], input_dim=10000, input_length=100)(main_input)
+
+    lstm1 = LSTM(50, input_shape=(timesteps, xtrain.shape[1]), return_sequences=True)
+    lstmPm25 = lstm1(inputs)
+    #lstm2 = LSTM(50, input_shape=(timesteps, xtrain.shape[1]), return_sequences=True)(lstmPm25)
+    lstmPm25 = Dense(1, activation='sigmoid')(lstmPm25)
+    lstmModel1 = Model(inputs, lstmPm25)
+
+    return lstmModel1
+
+##
+# CROSS VALIDATION - LSTMED
+kFolds = KFold(n_splits=5)
+countCross = 1
+for train, test in kFolds.split(X):
+    xTrain = X[train,:]
+    yTrain = Y[train,:]
+    xTest = X[test,:]
+    yTest = Y[test,:]
+    print("------------- CROSS VALIDATION ", countCross, "---------")
+    print("**********LTSMNN***********")
+    xTrain, yTrain = generate_train_samples(xTrain, yTrain, xTrain.shape[0],replace=True)
+    model = Sequential()
+    model.add(LSTM(50, input_shape=(xTrain.shape[1], xTrain.shape[2])))
+    model.add(Dense(1))
+    print(model.summary())
+    model.compile(loss='mae', optimizer='adam')
+
+
+    model.fit(xTrain, yTrain, epochs=30, batch_size=1000)
+
+    test_x = generate_test_samples(xTest,yTest)
+
+    yhat = model.predict(xTest)
+
+    yhat = np.reshape(yhat, (xTest.shape[0], xTest.shape[1]))
+    predictTest = scalar.inverse_transform(yhat)
+    yTestI = scalar.inverse_transform(yTest)
+    rmseTest = np.sqrt(mean_squared_error(yTestI, predictTest))
+    print("RMSE ", rmseTest)
+    countCross += 1
+
+
+##
 
